@@ -1897,7 +1897,6 @@ def test_row_index_projection_pushdown_18463(
         df.collect().select("index").slice(1, 1),
     )
 
-
 def test_concat_multiple_inmem() -> None:
     f = io.BytesIO()
     g = io.BytesIO()
@@ -1952,7 +1951,6 @@ def test_write_binary_open_file(tmp_path: Path) -> None:
 
     out = pl.read_parquet(path)
     assert_frame_equal(out, df)
-
 
 def test_prefilter_with_projection() -> None:
     f = io.BytesIO()
@@ -2442,3 +2440,18 @@ def test_dict_masked(
         pl.scan_parquet(f, parallel="prefiltered").filter(pl.col.f).collect(),
         df.filter(pl.col.f),
     )
+
+def test_skip_full_load_of_rgs_using_predicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: Any
+) -> None:
+    monkeypatch.setenv("POLARS_VERBOSE", "1")
+    monkeypatch.setenv("POLARS_FORCE_ASYNC", "1")
+    df = pl.DataFrame(
+        {"a": pl.arange(0, 10, eager=True), "b": pl.arange(0, 10, eager=True)}
+    )
+    root = tmp_path / "test_rg_skip.parquet"
+    df.write_parquet(root, use_pyarrow=True, row_group_size=2)
+
+    q = pl.scan_parquet(root, parallel="row_groups")
+    assert q.filter(pl.col("a").gt(6)).collect().shape == (3, 2)
+    assert "reduced the number of row groups in pruning by 3" in capfd.readouterr().err

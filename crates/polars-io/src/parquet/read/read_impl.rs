@@ -114,7 +114,7 @@ pub fn create_sorting_map(md: &RowGroupMetadata) -> PlHashMap<usize, IsSorted> {
     sorting_map
 }
 
-fn column_idx_to_series(
+pub fn column_idx_to_series(
     column_i: usize,
     // The metadata belonging to this column
     field_md: &[&ColumnChunkMetadata],
@@ -204,6 +204,7 @@ fn rg_to_dfs(
     row_group_end: usize,
     slice: (usize, usize),
     file_metadata: &FileMetadata,
+    row_groups: &Vec<RowGroupMetadata>,
     schema: &ArrowSchemaRef,
     predicate: Option<&dyn PhysicalIoExpr>,
     row_index: Option<RowIndex>,
@@ -243,6 +244,7 @@ fn rg_to_dfs(
                     row_group_start,
                     row_group_end,
                     file_metadata,
+                    row_groups,
                     schema,
                     live_variables,
                     predicate,
@@ -262,7 +264,7 @@ fn rg_to_dfs(
             row_group_start,
             row_group_end,
             slice,
-            file_metadata,
+            row_groups,
             schema,
             predicate,
             row_index,
@@ -277,7 +279,7 @@ fn rg_to_dfs(
             row_group_end,
             previous_row_count,
             slice,
-            file_metadata,
+            row_groups,
             schema,
             predicate,
             row_index,
@@ -307,6 +309,7 @@ fn rg_to_dfs_prefiltered(
     row_group_start: usize,
     row_group_end: usize,
     file_metadata: &FileMetadata,
+    row_groups: &[RowGroupMetadata],
     schema: &ArrowSchemaRef,
     live_variables: Vec<PlSmallStr>,
     predicate: &dyn PhysicalIoExpr,
@@ -324,7 +327,7 @@ fn rg_to_dfs_prefiltered(
         None => Vec::new(),
         Some(_) => (row_group_start..row_group_end)
             .map(|index| {
-                let md = &file_metadata.row_groups[index];
+                let md = &row_groups[index];
 
                 let current_offset = row_offset;
                 let current_row_count = md.num_rows() as IdxSize;
@@ -379,7 +382,7 @@ fn rg_to_dfs_prefiltered(
         (row_group_start..row_group_end)
             .into_par_iter()
             .map(|rg_idx| {
-                let md = &file_metadata.row_groups[rg_idx];
+                let md = &row_groups[rg_idx];
 
                 if use_statistics {
                     match read_this_row_group(Some(predicate), md, schema) {
@@ -615,7 +618,7 @@ fn rg_to_dfs_optionally_par_over_columns(
     row_group_start: usize,
     row_group_end: usize,
     slice: (usize, usize),
-    file_metadata: &FileMetadata,
+    row_groups: &[RowGroupMetadata],
     schema: &ArrowSchemaRef,
     predicate: Option<&dyn PhysicalIoExpr>,
     row_index: Option<RowIndex>,
@@ -626,20 +629,18 @@ fn rg_to_dfs_optionally_par_over_columns(
 ) -> PolarsResult<Vec<DataFrame>> {
     let mut dfs = Vec::with_capacity(row_group_end - row_group_start);
 
-    let mut n_rows_processed: usize = (0..row_group_start)
-        .map(|i| file_metadata.row_groups[i].num_rows())
-        .sum();
+    let mut n_rows_processed: usize = (0..row_group_start).map(|i| row_groups[i].num_rows()).sum();
     let slice_end = slice.0 + slice.1;
 
     for rg_idx in row_group_start..row_group_end {
-        let md = &file_metadata.row_groups[rg_idx];
+        let md = &row_groups[rg_idx];
 
         let rg_slice =
             split_slice_at_file(&mut n_rows_processed, md.num_rows(), slice.0, slice_end);
         let current_row_count = md.num_rows() as IdxSize;
 
         if use_statistics
-            && !read_this_row_group(predicate, &file_metadata.row_groups[rg_idx], schema)?
+            && !read_this_row_group(predicate, &row_groups[rg_idx], schema)?
         {
             *previous_row_count += rg_slice.1 as IdxSize;
             continue;
@@ -750,7 +751,7 @@ fn rg_to_dfs_par_over_rg(
     row_group_end: usize,
     previous_row_count: &mut IdxSize,
     slice: (usize, usize),
-    file_metadata: &FileMetadata,
+    row_groups: &[RowGroupMetadata],
     schema: &ArrowSchemaRef,
     predicate: Option<&dyn PhysicalIoExpr>,
     row_index: Option<RowIndex>,
@@ -759,16 +760,16 @@ fn rg_to_dfs_par_over_rg(
     hive_partition_columns: Option<&[Series]>,
 ) -> PolarsResult<Vec<DataFrame>> {
     // compute the limits per row group and the row count offsets
-    let mut row_groups = Vec::with_capacity(row_group_end - row_group_start);
+    let mut row_groups_iter = Vec::with_capacity(row_group_end - row_group_start);
 
     let mut n_rows_processed: usize = (0..row_group_start)
-        .map(|i| file_metadata.row_groups[i].num_rows())
+        .map(|i| row_groups[i].num_rows())
         .sum();
     let slice_end = slice.0 + slice.1;
 
     for i in row_group_start..row_group_end {
         let row_count_start = *previous_row_count;
-        let rg_md = &file_metadata.row_groups[i];
+        let rg_md = &row_groups[i];
         let rg_slice =
             split_slice_at_file(&mut n_rows_processed, rg_md.num_rows(), slice.0, slice_end);
         *previous_row_count = previous_row_count
@@ -779,15 +780,19 @@ fn rg_to_dfs_par_over_rg(
             continue;
         }
 
-        row_groups.push((rg_md, rg_slice, row_count_start));
+        row_groups_iter.push((i, rg_md, rg_slice, row_count_start));
     }
 
     let dfs = POOL.install(|| {
         // Set partitioned fields to prevent quadratic behavior.
         // Ensure all row groups are partitioned.
-        row_groups
+
+        row_groups_iter
             .into_par_iter()
-            .map(|(md, slice, row_count_start)| {
+            .enumerate()
+            .map(|(iter_idx, (_rg_idx, _md, slice, row_count_start))| {
+                let md = &row_groups[iter_idx];
+
                 if slice.1 == 0 || use_statistics && !read_this_row_group(predicate, md, schema)? {
                     return Ok(None);
                 }
@@ -859,6 +864,7 @@ pub fn read_parquet<R: MmapBytesReader>(
     projection: Option<&[usize]>,
     reader_schema: &ArrowSchemaRef,
     metadata: Option<FileMetadataRef>,
+    row_groups: Option<Vec<RowGroupMetadata>>,
     predicate: Option<&dyn PhysicalIoExpr>,
     mut parallel: ParallelStrategy,
     row_index: Option<RowIndex>,
@@ -878,6 +884,7 @@ pub fn read_parquet<R: MmapBytesReader>(
     let file_metadata = metadata
         .map(Ok)
         .unwrap_or_else(|| read::read_metadata(&mut reader).map(Arc::new))?;
+    let row_groups = row_groups.unwrap_or_else(|| file_metadata.row_groups.clone());
     let n_row_groups = file_metadata.row_groups.len();
 
     // if there are multiple row groups and categorical data
@@ -942,6 +949,7 @@ pub fn read_parquet<R: MmapBytesReader>(
         n_row_groups,
         slice,
         &file_metadata,
+        &row_groups,
         reader_schema,
         predicate,
         row_index.clone(),
@@ -1007,7 +1015,10 @@ impl From<FetchRowGroupsFromMmapReader> for RowGroupFetcher {
 }
 
 impl RowGroupFetcher {
-    async fn fetch_row_groups(&mut self, _row_groups: Range<usize>) -> PolarsResult<ColumnStore> {
+    pub async fn fetch_row_groups(
+        &mut self,
+        _row_groups: Range<usize>,
+    ) -> PolarsResult<ColumnStore> {
         match self {
             RowGroupFetcher::Local(f) => f.fetch_row_groups(_row_groups),
             #[cfg(feature = "cloud")]
@@ -1067,6 +1078,7 @@ pub struct BatchedParquetReader {
     projection: Arc<[usize]>,
     schema: ArrowSchemaRef,
     metadata: FileMetadataRef,
+    row_groups: Vec<RowGroupMetadata>,
     predicate: Option<Arc<dyn PhysicalIoExpr>>,
     row_index: Option<RowIndex>,
     rows_read: IdxSize,
@@ -1087,6 +1099,7 @@ impl BatchedParquetReader {
     pub fn new(
         row_group_fetcher: RowGroupFetcher,
         metadata: FileMetadataRef,
+        row_groups: Vec<RowGroupMetadata>,
         schema: ArrowSchemaRef,
         slice: (usize, usize),
         projection: Option<Vec<usize>>,
@@ -1098,7 +1111,7 @@ impl BatchedParquetReader {
         include_file_path: Option<(PlSmallStr, Arc<str>)>,
         mut parallel: ParallelStrategy,
     ) -> PolarsResult<Self> {
-        let n_row_groups = metadata.row_groups.len();
+        let n_row_groups = row_groups.len();
         let projection = projection
             .map(Arc::from)
             .unwrap_or_else(|| (0usize..schema.len()).collect::<Arc<[_]>>());
@@ -1124,6 +1137,7 @@ impl BatchedParquetReader {
             projection,
             schema,
             metadata,
+            row_groups,
             row_index,
             rows_read: 0,
             predicate,
@@ -1174,7 +1188,7 @@ impl BatchedParquetReader {
                 self.row_group_offset,
                 self.row_group_offset + n,
                 self.slice,
-                &self.metadata.row_groups,
+                &self.row_groups,
             );
 
             let store = self
@@ -1190,6 +1204,7 @@ impl BatchedParquetReader {
                     row_group_range.end,
                     self.slice,
                     &self.metadata,
+                    &self.row_groups,
                     &self.schema,
                     self.predicate.as_deref(),
                     self.row_index.clone(),
@@ -1213,6 +1228,7 @@ impl BatchedParquetReader {
                     let predicate = self.predicate.clone();
                     let schema = self.schema.clone();
                     let metadata = self.metadata.clone();
+                    let row_groups = self.row_groups.clone();
                     let parallel = self.parallel;
                     let projection = self.projection.clone();
                     let use_statistics = self.use_statistics;
@@ -1227,6 +1243,7 @@ impl BatchedParquetReader {
                             row_group_range.end,
                             slice,
                             &metadata,
+                            &row_groups,
                             &schema,
                             predicate.as_deref(),
                             row_index,

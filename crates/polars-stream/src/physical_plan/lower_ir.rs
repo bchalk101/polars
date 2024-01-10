@@ -226,6 +226,7 @@ pub fn lower_ir(
             },
             #[cfg(feature = "cloud")]
             SinkType::Cloud { .. } => todo!(),
+            &SinkType::Batch { .. } => todo!(),
         },
 
         IR::MapFunction { input, function } => {
