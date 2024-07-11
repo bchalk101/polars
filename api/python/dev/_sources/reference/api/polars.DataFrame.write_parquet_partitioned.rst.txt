@@ -1,0 +1,6 @@
+﻿polars.DataFrame.write\_parquet\_partitioned
+============================================
+
+.. currentmodule:: polars
+
+.. automethod:: DataFrame.write_parquet_partitioned
