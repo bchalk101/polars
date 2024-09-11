@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use futures::{StreamExt, TryStreamExt};
 use polars_core::config::{self, get_file_prefetch_size};
 use polars_core::error::*;
 use polars_core::prelude::Series;
@@ -36,12 +35,8 @@ pub struct ParquetSource {
     processed_paths: usize,
     processed_rows: AtomicUsize,
     iter: Range<usize>,
-<<<<<<< HEAD
     sources: ScanSources,
-=======
-    paths: Arc<Vec<PathBuf>>,
     total_files_read: usize,
->>>>>>> 5823b25d5 (feat(rust): optimize column load of row groups with predicate(#13608))
     options: ParquetOptions,
     file_options: FileScanOptions,
     #[allow(dead_code)]
@@ -199,7 +194,7 @@ impl ParquetSource {
         index: usize,
         n_rows: usize,
     ) -> PolarsResult<(ParquetAsyncReader, usize)> {
-        let metadata: Option<Arc<polars_io::prelude::FileMetaData>> = self.metadata.clone();
+        let metadata: Option<Arc<polars_io::prelude::FileMetadata>> = self.metadata.clone();
         let predicate = self.predicate.clone();
         let cloud_options = self.cloud_options.clone();
         let (path, options, file_options, projection, chunk_size, hive_partitions) =
@@ -294,12 +289,8 @@ impl ParquetSource {
             options,
             file_options,
             iter,
-<<<<<<< HEAD
             sources,
-=======
-            paths,
             total_files_read: 0,
->>>>>>> 5823b25d5 (feat(rust): optimize column load of row groups with predicate(#13608))
             cloud_options,
             metadata,
             file_info,
@@ -324,61 +315,64 @@ impl ParquetSource {
         //
         // It is important we do this for a reasonable batch size, that's why we start this when we
         // have just 2 readers left.
-        if self.batched_readers.is_empty()
-            && self.rows_left_to_read != 0
-            && self.total_files_read != self.paths.len()
-        {
+        if self.batched_readers.len() <= 2 || self.batched_readers.is_empty() {
             if self.run_async {
-                let range = 0..self.prefetch_size - self.batched_readers.len();
+                while self.rows_left_to_read != 0
+                    && self.iter.start < self.iter.end
+                    && self.batched_readers.is_empty()
+                {
+                    let range = 0..self.prefetch_size - self.batched_readers.len();
 
-                let range = range
-                    .zip(&mut self.iter)
-                    .map(|(_, index)| index)
-                    .collect::<Vec<_>>();
+                    let range = range
+                        .zip(&mut self.iter)
+                        .map(|(_, index)| index)
+                        .collect::<Vec<_>>();
 
-                let readers = range
-                    .clone()
-                    .into_iter()
-                    .map(|index| self.init_reader_async(index, self.rows_left_to_read));
-                let mut readers = polars_io::pl_async::get_runtime()
-                    .block_on(async { futures::future::try_join_all(readers).await })?;
-
-                let num_rows_to_read = readers
-                    .iter_mut()
-                    .map(|(reader, _chunk_size)| self.num_rows_per_reader(reader));
-
-                let num_rows_to_read = polars_io::pl_async::get_runtime()
-                    .block_on(async { futures::future::try_join_all(num_rows_to_read).await })?;
-
-                let num_rows_to_read = num_rows_to_read
-                    .into_iter()
-                    .zip(readers)
-                    .map(|(rows_per_reader, (reader, chunk_size))| {
-                        self.total_files_read += 1;
-                        if self.rows_left_to_read == 0 {
-                            return (reader, chunk_size, 0);
-                        }
-                        self.rows_left_to_read =
-                            self.rows_left_to_read.saturating_sub(rows_per_reader);
-                        (reader, chunk_size, rows_per_reader)
-                    })
-                    .filter(|(_reader, _chunk_size, rows_per_reader)| *rows_per_reader != 0)
-                    .collect::<Vec<_>>();
-
-                let init_iter =
-                    num_rows_to_read
+                    let readers = range
+                        .clone()
                         .into_iter()
-                        .map(|(reader, chunk_size, _num_rows)| {
-                            self.init_batch_reader(reader, chunk_size)
-                        });
+                        .map(|index| self.init_reader_async(index, self.rows_left_to_read));
+                    let mut readers = polars_io::pl_async::get_runtime()
+                        .block_on(async { futures::future::try_join_all(readers).await })?;
 
-                let batched_readers =
-                    polars_io::pl_async::get_runtime().block_on_potential_spawn(async {
-                        futures::future::try_join_all(init_iter).await
+                    let num_rows_to_read = readers
+                        .iter_mut()
+                        .map(|(reader, _chunk_size)| self.num_rows_per_reader(reader));
+
+                    let num_rows_to_read = polars_io::pl_async::get_runtime().block_on(async {
+                        futures::future::try_join_all(num_rows_to_read).await
                     })?;
 
-                for r in batched_readers {
-                    self.finish_init_reader(r)?;
+                    let num_rows_to_read = num_rows_to_read
+                        .into_iter()
+                        .zip(readers)
+                        .map(|(rows_per_reader, (reader, chunk_size))| {
+                            self.total_files_read += 1;
+                            if self.rows_left_to_read == 0 {
+                                return (reader, chunk_size, 0);
+                            }
+                            self.rows_left_to_read =
+                                self.rows_left_to_read.saturating_sub(rows_per_reader);
+                            (reader, chunk_size, rows_per_reader)
+                        })
+                        .filter(|(_reader, _chunk_size, rows_per_reader)| *rows_per_reader != 0)
+                        .collect::<Vec<_>>();
+
+                    let init_iter =
+                        num_rows_to_read
+                            .into_iter()
+                            .map(|(reader, chunk_size, _num_rows)| {
+                                self.init_batch_reader(reader, chunk_size)
+                            });
+
+                    let batched_readers = polars_io::pl_async::get_runtime()
+                        .block_on_potential_spawn(async {
+                            futures::future::try_join_all(init_iter).await
+                        })?;
+
+                    for r in batched_readers {
+                        self.finish_init_reader(r)?;
+                    }
                 }
             } else {
                 for _ in 0..self.prefetch_size - self.batched_readers.len() {
@@ -395,9 +389,9 @@ impl Source for ParquetSource {
         self.prefetch_files()?;
 
         let Some(mut reader) = self.batched_readers.pop_front() else {
-            if self.total_files_read != self.paths.len() && self.rows_left_to_read != 0 {
-                return self.get_batches(_context);
-            }
+            // if self.rows_left_to_read != 0 {
+            //     return self.get_batches(_context);
+            // }
             return Ok(SourceResult::Finished);
         };
 

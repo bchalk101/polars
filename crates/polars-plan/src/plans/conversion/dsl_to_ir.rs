@@ -869,6 +869,12 @@ fn expand_scan_paths_with_hive_update(
     cloud_options: &Option<CloudOptions>,
 ) -> PolarsResult<Arc<[PathBuf]>> {
     let hive_enabled = file_options.hive_options.enabled;
+    if !hive_enabled.unwrap_or(false) && !file_options.glob
+        || hive_enabled.unwrap_or(false) && file_options.hive_options.schema.is_some()
+    {
+        let expanded_paths: Arc<[PathBuf]> = paths.into();
+        return Ok(expanded_paths);
+    }
     let (expanded_paths, hive_start_idx) = expand_paths_hive(
         paths,
         file_options.glob,
