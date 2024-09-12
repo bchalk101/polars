@@ -248,7 +248,7 @@ fn rg_to_dfs_prefiltered(
         None => Vec::new(),
         Some(_) => (row_group_start..row_group_end)
             .map(|index| {
-                let md = &file_metadata.row_groups[index];
+                let md = &row_groups[index];
 
                 let current_offset = row_offset;
                 let current_row_count = md.num_rows() as IdxSize;
@@ -305,7 +305,7 @@ fn rg_to_dfs_prefiltered(
         (row_group_start..row_group_end)
             .into_par_iter()
             .map(|rg_idx| {
-                let md = &file_metadata.row_groups[rg_idx];
+                let md = &row_groups[rg_idx];
 
                 if use_statistics {
                     match read_this_row_group(Some(predicate), md, schema) {

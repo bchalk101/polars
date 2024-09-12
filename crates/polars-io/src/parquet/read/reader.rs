@@ -518,8 +518,7 @@ impl ParquetAsyncReader {
             .map(|md| {
 
 
-                if !read_this_row_group(predicate.clone().as_deref(), &md, schema).unwrap()
-                    || remaining_rows == 0
+                if remaining_rows == 0
                 {
                     return (0, md);
                 }
