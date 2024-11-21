@@ -314,7 +314,6 @@ pub struct ParquetAsyncReader {
     include_file_path: Option<(PlSmallStr, Arc<str>)>,
     schema: Option<ArrowSchemaRef>,
     parallel: ParallelStrategy,
-    row_groups: Option<Vec<RowGroupMetadata>>,
 }
 
 #[cfg(feature = "cloud")]
@@ -336,7 +335,6 @@ impl ParquetAsyncReader {
             include_file_path: None,
             schema: None,
             parallel: Default::default(),
-            row_groups: None,
         })
     }
 
@@ -420,17 +418,6 @@ impl ParquetAsyncReader {
         self
     }
 
-    pub async fn num_rows_with_predicate(&mut self) -> PolarsResult<usize> {
-        let row_sizes = self
-            .prune_row_groups(self.reader.clone())
-            .await?
-            .iter()
-            .map(|(row_size, _md)| *row_size)
-            .collect::<Vec<_>>();
-
-        Ok(row_sizes.iter().sum())
-    }
-
     pub fn with_row_index(mut self, row_index: Option<RowIndex>) -> Self {
         self.row_index = row_index;
         self
@@ -478,27 +465,40 @@ impl ParquetAsyncReader {
 
     pub async fn batched(mut self, chunk_size: usize) -> PolarsResult<BatchedParquetReader> {
         let metadata = self.reader.get_metadata().await?.clone();
+
         let schema = match self.schema {
             Some(schema) => schema,
             None => self.schema().await?,
         };
-        let mut row_groups = self
-            .row_groups
-            .clone()
-            .unwrap_or(metadata.row_groups.clone());
 
-        if self.slice.1 != 0 {
-            self.slice = (0, usize::MAX);
-        } else {
-            row_groups = vec![];
-        }
+        let row_groups = match self.predicate.clone() {
+            Some(_predicate) =>  prune_row_groups(
+                self.reader.clone(),
+                schema.clone(),
+                self.projection.clone(),
+                self.predicate.clone(),
+                self.hive_partition_columns.clone(),
+            )
+            .await?
+            .clone()
+            .into_iter()
+            .map(|(_row_count, row_group_metadata)| row_group_metadata)
+            .collect::<Vec<_>>(),
+            None => metadata.row_groups.clone()
+        };
+
         // row group fetched deals with projection
         let row_group_fetcher = FetchRowGroupsFromObjectStore::new(
             self.reader,
             schema.clone(),
             self.projection.as_deref(),
             self.predicate.clone(),
-            compute_row_group_range(0, metadata.row_groups.len(), self.slice, &row_groups),
+            compute_row_group_range(
+                0,
+                row_groups.len(),
+                self.slice,
+                &row_groups,
+            ),
             &row_groups,
         )?
         .into();
@@ -555,122 +555,104 @@ impl ParquetAsyncReader {
         }
         Ok(df)
     }
+}
 
-    #[cfg(feature = "cloud")]
-    async fn prune_row_groups(
-        &mut self,
-        reader: ParquetObjectStore,
-    ) -> PolarsResult<Vec<(usize, read::RowGroupMetadata)>> {
-        use polars_parquet::read::Filter;
+#[cfg(feature = "cloud")]
+async fn prune_row_groups(
+    mut reader: ParquetObjectStore,
+    schema: ArrowSchemaRef,
+    projection: Option<Vec<usize>>,
+    predicate: Option<Arc<dyn PhysicalIoExpr>>,
+    hive_partition_columns: Option<Vec<Series>>,
+) -> PolarsResult<Vec<(usize, read::RowGroupMetadata)>> {
+    use polars_parquet::read::Filter;
 
-        let metadata = self.reader.get_metadata().await?.clone();
-        let schema = &self.schema().await?;
+    let metadata = reader.get_metadata().await?.clone();
 
-        let predicate = self.predicate.clone();
-        let projection = self.projection.as_deref();
-        let hive_partition_columns = self.hive_partition_columns.as_deref();
+    let predicate_columns = predicate.clone().unwrap().columns();
+    let predicate_projection = materialize_projection(
+        Some(&predicate_columns),
+        &Schema::from_arrow_schema(&schema.clone()),
+        hive_partition_columns.as_deref(),
+        false,
+    );
 
-        let predicate_columns = predicate.clone().unwrap().columns();
-        let predicate_projection = materialize_projection(
-            Some(&predicate_columns),
-            &Schema::from_arrow_schema(&schema.clone()),
-            hive_partition_columns,
-            false,
-        );
-
-        let mut predicate_row_group_fetcher: RowGroupFetcher = FetchRowGroupsFromObjectStore::new(
-            reader,
-            schema.clone(),
-            projection,
-            predicate.clone(),
-            compute_row_group_range(
-                0,
-                metadata.row_groups.len(),
-                (0, usize::MAX),
-                &metadata.row_groups,
-            ),
+    let mut predicate_row_group_fetcher: RowGroupFetcher = FetchRowGroupsFromObjectStore::new(
+        reader,
+        schema.clone(),
+        projection.as_deref(),
+        predicate.clone(),
+        compute_row_group_range(
+            0,
+            metadata.row_groups.len(),
+            (0, usize::MAX),
             &metadata.row_groups,
-        )?
-        .into();
+        ),
+        &metadata.row_groups,
+    )?
+    .into();
 
-        let predicate_store: ColumnStore = predicate_row_group_fetcher
-            .fetch_row_groups(0..metadata.row_groups.len())
-            .await?;
+    let predicate_store: ColumnStore = predicate_row_group_fetcher
+        .fetch_row_groups(0..metadata.row_groups.len())
+        .await?;
 
-        let mut remaining_rows = self.slice.1;
+    let row_groups = metadata.row_groups.clone();
+    let final_row_groups = row_groups
+        .iter()
+        .map(|md| {
+            let columns = predicate_projection
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|column_i| {
+                    let (name, field) = schema.get_at_index(*column_i).unwrap();
 
-        let row_groups = metadata.row_groups.clone();
-        let final_row_groups = row_groups
-            .iter()
-            .map(|md| {
-                if remaining_rows == 0 {
-                    return (0, md);
-                }
+                    let Some(iter) = md.columns_under_root_iter(name) else {
+                        return Ok(Column::full_null(
+                            name.clone(),
+                            md.num_rows(),
+                            &DataType::from_arrow(&field.dtype, true),
+                        ));
+                    };
 
-                let columns = predicate_projection
-                    .as_ref()
-                    .unwrap()
-                    .iter()
-                    .map(|column_i| {
-                        let (name, field) = schema.get_at_index(*column_i).unwrap();
+                    let part = iter.collect::<Vec<_>>();
 
-                        let Some(iter) = md.columns_under_root_iter(name) else {
-                            return Ok(Column::full_null(
-                                name.clone(),
-                                md.num_rows(),
-                                &DataType::from_arrow(&field.dtype, true),
-                            ));
-                        };
+                    let series = column_idx_to_series(
+                        *column_i,
+                        part.as_slice(),
+                        Some(Filter::new_ranged(0, usize::MAX)),
+                        &schema,
+                        &predicate_store,
+                    )?;
 
-                        let part = iter.collect::<Vec<_>>();
+                    Ok(series.into_column())
+                })
+                .collect::<PolarsResult<Vec<_>>>()
+                .unwrap();
 
-                        let series = column_idx_to_series(
-                            *column_i,
-                            part.as_slice(),
-                            Some(Filter::new_ranged(0, usize::MAX)),
-                            schema,
-                            &predicate_store,
-                        )?;
+            let mut df = unsafe { DataFrame::new_no_checks(md.num_rows(), columns) };
+            let reader_schema = schema.as_ref();
 
-                        Ok(series.into_column())
-                    })
-                    .collect::<PolarsResult<Vec<_>>>()
-                    .unwrap();
+            materialize_hive_partitions(
+                &mut df,
+                reader_schema,
+                hive_partition_columns.as_deref(),
+                md.num_rows(),
+            );
+            apply_predicate(&mut df, predicate.as_deref(), false).unwrap();
 
-                let mut df = unsafe { DataFrame::new_no_checks(md.num_rows(), columns) };
-                let reader_schema = schema.as_ref();
+            let row_count = df.height();
 
-                materialize_hive_partitions(
-                    &mut df,
-                    reader_schema,
-                    hive_partition_columns,
-                    md.num_rows(),
-                );
-                apply_predicate(&mut df, predicate.as_deref(), false).unwrap();
-
-                let row_count = df.height();
-
-                remaining_rows = remaining_rows.saturating_sub(row_count);
-
-                (row_count, md)
-            })
-            .filter(|(row_count, _md)| *row_count != 0)
-            .map(|(row_count, md)| (row_count, md.clone()))
-            .collect::<Vec<_>>();
-        if verbose() {
-            eprintln!(
-                "reduced the number of row groups in pruning by {}",
-                row_groups.len() - final_row_groups.len()
-            )
-        }
-        let row_groups = Some(
-            final_row_groups
-                .clone()
-                .into_iter()
-                .map(|(_row_countm, row_group_metadata)| row_group_metadata)
-                .collect::<Vec<_>>(),
-        );
-        self.row_groups = row_groups;
-        Ok(final_row_groups)
+            (row_count, md)
+        })
+        .filter(|(row_count, _md)| *row_count != 0)
+        .map(|(row_count, md)| (row_count, md.clone()))
+        .collect::<Vec<_>>();
+    if verbose() {
+        eprintln!(
+            "reduced the number of row groups in pruning by {}",
+            row_groups.len() - final_row_groups.len()
+        )
     }
+    Ok(final_row_groups)
 }
